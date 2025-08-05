@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Welcome file</title>
+  <link rel="stylesheet" href="https://stackedit.io/style.css" />
+</head>
+
+<body class="stackedit">
+  <div class="stackedit__html"><h4 id="initial-problem-model-incompatibility"><strong>1. Initial Problem: Model Incompatibility</strong></h4>
+<p>My first attempt was to use Pruna’s automatic cacher, as it seemed like the most straightforward approach for a custom pipeline.</p>
+<ul>
+<li><strong><code>SmashConfig</code> used:</strong><pre class=" language-python"><code class="prism  language-python">smash_config<span class="token punctuation">[</span><span class="token string">"cacher"</span><span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token string">"auto"</span>
+smash_config<span class="token punctuation">[</span><span class="token string">"auto_custom_model"</span><span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token boolean">True</span>
+smash_config<span class="token punctuation">[</span><span class="token string">"compiler"</span><span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token string">"torch_compile"</span>
+</code></pre>
+</li>
+<li><strong>Error:</strong> <code>Pruna optimization failed: Model is not compatible with auto</code>.</li>
+<li><strong>Reason:</strong> I concluded that Pruna’s automatic cacher does not have a built-in “helper” for our custom <code>MultiTalkPipeline</code> architecture and therefore could not proceed.</li>
+</ul>
+<h4 id="second-problem-torch.compile-dynamic-shape-error"><strong>2. Second Problem: <code>torch.compile</code> Dynamic Shape Error</strong></h4>
+<p>Based on the initial failure, we pivoted to a compile-only strategy, targeting the core DiT model (<code>wan_i2v.model</code>) instead of the entire pipeline.</p>
+<ul>
+<li><strong><code>SmashConfig</code> used:</strong><pre class=" language-python"><code class="prism  language-python">smash_config<span class="token punctuation">[</span><span class="token string">"compiler"</span><span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token string">"torch_compile"</span>
+</code></pre>
+</li>
+<li><strong>Error:</strong> <code>torch._dynamo.exc.UserError: Could not guard on data-dependent expression u0 &lt; 0</code>.</li>
+<li><strong>Reason:</strong> The traceback clearly pointed to the <code>rope_apply</code> function, which uses slicing and reshaping operations based on the dynamic shape of the input tensor. <code>torch.compile</code> in its default (static) mode could not create a static graph for this function.</li>
+</ul>
+<h4 id="third-problem-handling-torch.compiler.disable"><strong>3. Third Problem: Handling <code>torch.compiler.disable</code></strong></h4>
+<p>To solve the dynamic shape issue, I tried to instruct the compiler to skip the problematic <code>rope_apply</code> function.</p>
+<ul>
+<li><strong>Fix Attempt #1:</strong>  added a patch in our script to apply <code>torch._dynamo.disable(rope_apply)</code> at runtime.</li>
+<li><strong>Fix Attempt #2:</strong>  modified the library code directly, adding the <code>@torch.compiler.disable</code> decorator to the <code>rope_apply</code> function in <code>wan/modules/multitalk_model.py</code>.</li>
+<li><strong>Error (for both attempts):</strong> <code>torch._dynamo.exc.Unsupported: Skip calling 'torch.compiler.disable()'d function</code>.</li>
+<li><strong>Reason:</strong> I assumed/discovered(not sure xD. Sorry. ) that Pruna’s <code>smash</code> function was calling <code>torch.compile</code> with <code>fullgraph=True</code>. This mode forces the entire model to be compiled into a single graph and raises an error when it encounters a disabled function, rather than creating a graph break and falling back to eager execution.</li>
+</ul>
+<h4 id="fourth-problem-smashconfig"><strong>4. Fourth Problem: <code>SmashConfig</code></strong></h4>
+<p>The next logical step was to tell Pruna to call the compiler with <code>fullgraph=False</code>.</p>
+<ul>
+<li><strong>Fix Attempt #1:</strong> I tried passing <code>smash_config["torch_compile_kwargs"] = {"fullgraph": False}</code>.</li>
+<li><strong>Error:</strong> <code>KeyError: 'torch_compile_kwargs'</code>.</li>
+<li><strong>Fix Attempt #2:</strong> We tried passing a lambda function: <code>smash_config["compiler"] = lambda m: torch.compile(m, fullgraph=False)</code>.</li>
+<li><strong>Error:</strong> <code>ConfigSpace.exceptions.IllegalValueError: Value &lt;function ...&gt; is not allowed</code>.</li>
+<li><strong>Reason:</strong> These errors made it clear that <code>SmashConfig</code> has a strict schema that only accepts a predefined set of string values for the <code>"compiler"</code> key and does not support passing custom arguments or callables.</li>
+</ul>
+<h4 id="the-working-solution--the-final-performance-problem"><strong>5. The “Working” Solution &amp; The Final Performance Problem</strong></h4>
+<p>The final workaround was to bypass Pruna’s compiler abstraction entirely.</p>
+<ul>
+<li><strong>Final Fix:</strong>
+<ol>
+<li>In our script, we first manually compile the model: <code>wan_i2v.model = torch.compile(wan_i2v.model, fullgraph=False, dynamic=True)</code>.</li>
+<li>We then call <code>smash</code> but explicitly disable Pruna’s compiler: <code>smash_config["compiler"] = None</code>.</li>
+</ol>
+</li>
+<li><strong>Result:</strong> This successfully prevented all crashes, and the script ran to completion.</li>
+</ul>
+<p><strong>However, this is where the core problem lies: there is no significant performance gain.</strong></p>
+<ul>
+<li><strong>Without Pruna:</strong> Video Generation time was <strong>~350 seconds</strong>.</li>
+<li><strong>With the final fix:</strong> Video Generation time was <strong>~341 seconds</strong>.</li>
+</ul>
+<p>This marginal 10-second improvement is negligible and offset by the compilation overhead, leading to a similar or slightly worse total execution time.</p>
+<h4 id="finally-thanks-for-reading-until-here"><strong>Finally, Thanks for Reading until here</strong></h4>
+<p>The logs from the successful run reveal the root cause. Although the script doesn’t crash, the <code>torch.compile</code> process is not effective because its backend (<code>inductor</code>) is failing on other operations within the model.</p>
+<p>Specially after my final approach on disabling <em>Pruna’s</em> compiler, i tried compiling on my own using torch and ran into this error. Not sure on the next steps but, would greatly appreaciate your inputs here.</p>
+<pre><code>W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0] Backend compiler exception
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]   Explanation: Backend compiler `inductor` failed with aten._local_scalar_dense.default
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0] 
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]     While executing %reshape : [num_users=1] = call_method[target=reshape](args = (%l_x_, [%l_shape_0_, %l_shape_1_, %l_shape_2_, %l_shape_3_]), kwargs = {})
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]     GraphModule: class GraphModule(torch.nn.Module):
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]         def forward(self, s0: "Sym(s0)", s1: "Sym(s1)", L_x_: "bf16[1, s0, s1][s0*s1, s1, 1]", L_shape_2_: "i64[][]", L_shape_1_: "i64[][]", L_shape_0_: "Sym(1)", L_shape_3_: "Sym(s1)"):
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]             l_x_ = L_x_
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]             l_shape_2_ = L_shape_2_
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]             l_shape_1_ = L_shape_1_
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]             l_shape_0_ = L_shape_0_
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]             l_shape_3_ = L_shape_3_
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]         
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]              # File: /usr/local/lib/python3.10/dist-packages/einops/_backends.py:93 in reshape, code: return x.reshape(shape)
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]             reshape: "bf16[1, s4, (s0//s4), s1][s0*s1, s1*((s0//s4)), s1, 1]" = l_x_.reshape([l_shape_0_, l_shape_1_, l_shape_2_, l_shape_3_]);  l_x_ = l_shape_0_ = l_shape_1_ = l_shape_2_ = l_shape_3_ = None
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]             return (reshape,)
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]         
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0] 
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]     Original traceback:
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]       File "/usr/local/lib/python3.10/dist-packages/einops/_backends.py", line 93, in reshape
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]         return x.reshape(shape)
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]     . Adding a graph break.
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]   Hint: Report an issue to the backend compiler repo.
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0] 
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]   Developer debug context: Backend: inductor
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]     Exception:aten._local_scalar_dense.default
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0] 
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]     While executing %reshape : [num_users=1] = call_method[target=reshape](args = (%l_x_, [%l_shape_0_, %l_shape_1_, %l_shape_2_, %l_shape_3_]), kwargs = {})
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]     GraphModule: class GraphModule(torch.nn.Module):
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]         def forward(self, s0: "Sym(s0)", s1: "Sym(s1)", L_x_: "bf16[1, s0, s1][s0*s1, s1, 1]", L_shape_2_: "i64[][]", L_shape_1_: "i64[][]", L_shape_0_: "Sym(1)", L_shape_3_: "Sym(s1)"):
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]             l_x_ = L_x_
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]             l_shape_2_ = L_shape_2_
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]             l_shape_1_ = L_shape_1_
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]             l_shape_0_ = L_shape_0_
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]             l_shape_3_ = L_shape_3_
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]         
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]              # File: /usr/local/lib/python3.10/dist-packages/einops/_backends.py:93 in reshape, code: return x.reshape(shape)
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]             reshape: "bf16[1, s4, (s0//s4), s1][s0*s1, s1*((s0//s4)), s1, 1]" = l_x_.reshape([l_shape_0_, l_shape_1_, l_shape_2_, l_shape_3_]);  l_x_ = l_shape_0_ = l_shape_1_ = l_shape_2_ = l_shape_3_ = None
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]             return (reshape,)
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]         
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0] 
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]     Original traceback:
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]       File "/usr/local/lib/python3.10/dist-packages/einops/_backends.py", line 93, in reshape
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]         return x.reshape(shape)
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0] 
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]     Traceback:
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]       File "/usr/local/lib/python3.10/dist-packages/einops/_backends.py", line 93, in reshape
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0]         return x.reshape(shape)
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0] 
+W0805 07:54:30.240000 666493 torch/_dynamo/exc.py:514] [33/0] 
+W0805 07:54:36.505000 666493 torch/fx/experimental/symbolic_shapes.py:6679] [38/0] failed during evaluate_expr(u0*u1*u2 &lt; 0, hint=None, size_oblivious=True, forcing_spec=False
+E0805 07:54:36.506000 666493 torch/fx/experimental/recording.py:299] [38/0] failed while running evaluate_expr(*(u0*u1*u2 &lt; 0, None, False, True), **{})
+</code></pre>
+<p>This log indicates that even with <code>fullgraph=False</code>, the <code>inductor</code> backend is unable to handle a <code>reshape</code> operation coming from the <code>einops</code> library. Because of this, Dynamo is forced to insert a graph break. It appears many such breaks are occurring, meaning the model is being compiled into many small, disconnected graphs. The overhead of managing these breaks likely negates any performance gains from the parts that do compile successfully.</p>
+<p>In summary, while we navigated the API and initial model incompatibilities, the core <code>MultiTalk</code> model architecture contains operations (specifically from <code>einops</code>) that the <code>torch.compile</code> backend cannot currently optimize, resulting in no net speedup.</p>
+<p><strong>Any assumption made here or above, is a collective decision from me &amp; AI together. Please correct me if i am wrong anywhere on the journey.</strong></p>
+</div>
+</body>
+
+</html>
