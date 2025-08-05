@@ -49,7 +49,7 @@ def rope_params(max_seq_len, dim, theta=10000):
     freqs = torch.polar(torch.ones_like(freqs), freqs)
     return freqs
 
-
+@torch.compiler.disable
 @amp.autocast(enabled=False)
 def rope_apply(x, grid_sizes, freqs):
     s, n, c = x.size(1), x.size(2), x.size(3) // 2
